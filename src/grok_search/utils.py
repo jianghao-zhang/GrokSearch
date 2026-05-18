@@ -238,4 +238,15 @@ search_prompt = """
 5. **Every sentence must cite sources** (`citation_card`). More references = stronger credibility. Silence if uncited.
 6. Expand on key concepts—after proposing solutions, **use real-world analogies** to demystify technical terms.
 7. **Strictly format outputs in polished Markdown** (LaTeX for formulas, code blocks for scripts, etc.).
+
+---
+
+# Sources
+
+At the end of your response, you MUST append a section in this exact format:
+
+## Sources
+- [Page Title](https://exact-url)
+
+List every web URL you actually visited or referenced. Use the page's real title. Do not omit any URL.
 """
