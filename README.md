@@ -180,7 +180,7 @@ claude mcp list
 ## 三、MCP 工具介绍
 
 <details>
-<summary>本项目提供八个 MCP 工具（展开查看）</summary>
+<summary>本项目提供十二个 MCP 工具（展开查看）</summary>
 
 ### `web_search` — AI 网络搜索
 
@@ -201,6 +201,34 @@ claude mcp list
 - `session_id`: 本次查询的会话 ID
 - `content`: Grok 回答正文（已自动剥离信源）
 - `sources_count`: 已缓存的信源数量
+
+### `submit_search_job` — 后台搜索任务
+
+提交长时间 Grok 搜索任务并立即返回 `job_id`。适合 `grok-4.20-multi-agent-xhigh`、市场研究、深度检索等可能运行数分钟的任务。
+
+任务状态持久化到本地 SQLite，worker 会定期写入 heartbeat；即使前台调用结束，也可以继续用 `get_search_job` 查询结果。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `query` | string | ✅ | - | 搜索查询语句 |
+| `platform` | string | ❌ | `""` | 聚焦平台 |
+| `model` | string | ❌ | `""` | 按任务指定模型，空值使用当前默认模型 |
+| `extra_sources` | int | ❌ | `0` | 额外补充信源数量 |
+| `timeout_s` | int | ❌ | `900` | 最大运行秒数，上限 7200 |
+
+### `get_search_job` — 查询后台任务
+
+通过 `job_id` 查询任务状态。任务成功后返回 `content`、`sources_count`，并把 `job_id` 作为可用于 `get_sources` 的 `session_id`。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `job_id` | string | ✅ | - | `submit_search_job` 返回的任务 ID |
+| `include_sources` | bool | ❌ | `false` | 是否在同一响应中返回完整信源列表 |
+| `max_content_chars` | int | ❌ | `50000` | 内联返回正文的最大字符数 |
+
+### `list_search_jobs` / `cancel_search_job` — 任务管理
+
+`list_search_jobs` 查看最近后台任务；`cancel_search_job(job_id)` 取消排队或运行中的任务。
 
 ### `get_sources` — 获取信源
 
