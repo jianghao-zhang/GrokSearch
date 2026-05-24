@@ -12,35 +12,17 @@ from pydantic import Field
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
+    from grok_search.providers.grok import GrokSearchProvider
     from grok_search.logger import log_info
     from grok_search.config import config
-    from grok_search.sources import SourcesCache, new_session_id
+    from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
     from grok_search.planning import engine as planning_engine, _split_csv
-    from grok_search.runner import run_search
-    from grok_search.jobs import (
-        create_search_job,
-        fail_job,
-        get_search_job as load_search_job,
-        list_search_jobs as load_search_jobs,
-        normalize_timeout,
-        request_cancel,
-        spawn_worker,
-    )
 except ImportError:
+    from .providers.grok import GrokSearchProvider
     from .logger import log_info
     from .config import config
-    from .sources import SourcesCache, new_session_id
+    from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
     from .planning import engine as planning_engine, _split_csv
-    from .runner import run_search
-    from .jobs import (
-        create_search_job,
-        fail_job,
-        get_search_job as load_search_job,
-        list_search_jobs as load_search_jobs,
-        normalize_timeout,
-        request_cancel,
-        spawn_worker,
-    )
 
 import asyncio
 
@@ -89,6 +71,46 @@ async def _get_available_models_cached(api_url: str, api_key: str) -> list[str]:
     return models
 
 
+def _extra_results_to_sources(
+    tavily_results: list[dict] | None,
+    firecrawl_results: list[dict] | None,
+) -> list[dict]:
+    sources: list[dict] = []
+    seen: set[str] = set()
+
+    if firecrawl_results:
+        for r in firecrawl_results:
+            url = (r.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            item: dict = {"url": url, "provider": "firecrawl"}
+            title = (r.get("title") or "").strip()
+            if title:
+                item["title"] = title
+            desc = (r.get("description") or "").strip()
+            if desc:
+                item["description"] = desc
+            sources.append(item)
+
+    if tavily_results:
+        for r in tavily_results:
+            url = (r.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            item: dict = {"url": url, "provider": "tavily"}
+            title = (r.get("title") or "").strip()
+            if title:
+                item["title"] = title
+            content = (r.get("content") or "").strip()
+            if content:
+                item["description"] = content
+            sources.append(item)
+
+    return sources
+
+
 @mcp.tool(
     name="web_search",
     output_schema=None,
@@ -125,178 +147,67 @@ async def web_search(
             return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
         effective_model = model
 
-    result = await run_search(
-        query,
-        platform,
-        effective_model,
-        extra_sources,
-        suppress_grok_errors=True,
-    )
+    grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
 
-    await _SOURCES_CACHE.set(session_id, result.sources)
-    return {"session_id": session_id, "content": result.content, "sources_count": len(result.sources)}
+    # 计算额外信源配额
+    has_tavily = bool(config.tavily_api_key)
+    has_firecrawl = bool(config.firecrawl_api_key)
+    firecrawl_count = 0
+    tavily_count = 0
+    if extra_sources > 0:
+        if has_firecrawl and has_tavily:
+            firecrawl_count = round(extra_sources * 1)
+            tavily_count = extra_sources - firecrawl_count
+        elif has_firecrawl:
+            firecrawl_count = extra_sources
+        elif has_tavily:
+            tavily_count = extra_sources
 
+    # 并行执行搜索任务
+    async def _safe_grok() -> str:
+        try:
+            return await grok_provider.search(query, platform)
+        except Exception:
+            return ""
 
-def _estimate_job_duration(model: str) -> dict:
-    model_l = (model or "").lower()
-    if "xhigh" in model_l:
-        return {"typical_s": "60-240", "note": "16-agent/xhigh; market or research tasks may run several minutes"}
-    if "multi-agent" in model_l:
-        return {"typical_s": "40-120", "note": "multi-agent medium; complex tasks may run longer"}
-    return {"typical_s": "20-90", "note": "depends on upstream search depth and source count"}
+    async def _safe_tavily() -> list[dict] | None:
+        try:
+            if tavily_count:
+                return await _call_tavily_search(query, tavily_count)
+        except Exception:
+            return None
 
+    async def _safe_firecrawl() -> list[dict] | None:
+        try:
+            if firecrawl_count:
+                return await _call_firecrawl_search(query, firecrawl_count)
+        except Exception:
+            return None
 
-@mcp.tool(
-    name="submit_search_job",
-    output_schema=None,
-    description="""
-    Submit a long-running Grok web search as a background job and return immediately.
+    coros: list = [_safe_grok()]
+    if tavily_count > 0:
+        coros.append(_safe_tavily())
+    if firecrawl_count > 0:
+        coros.append(_safe_firecrawl())
 
-    Use this instead of web_search for tasks that may take a minute or longer.
-    The job keeps running in a detached worker process. Use get_search_job with
-    the returned job_id to poll status and collect the result.
-    """,
-    meta={"version": "1.0.0", "author": "guda.studio"},
-)
-async def submit_search_job(
-    query: Annotated[str, "Clear, self-contained natural-language search query."],
-    platform: Annotated[str, "Target platform to focus on. Leave empty for general web search."] = "",
-    model: Annotated[str, "Optional model ID for this job. Leave empty to use current default."] = "",
-    extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable."] = 0,
-    timeout_s: Annotated[int, Field(description="Maximum runtime in seconds. Defaults to 900 and caps at 7200.", ge=0, le=7200)] = 900,
-) -> dict:
-    try:
-        api_url = config.grok_api_url
-        api_key = config.grok_api_key
-    except ValueError as e:
-        return {"status": "failed", "error": f"配置错误: {str(e)}"}
+    gathered = await asyncio.gather(*coros)
 
-    effective_model = config.grok_model
-    if model:
-        available = await _get_available_models_cached(api_url, api_key)
-        if available and model not in available:
-            return {"status": "failed", "error": f"无效模型: {model}"}
-        effective_model = model
+    grok_result: str = gathered[0] or ""
+    tavily_results: list[dict] | None = None
+    firecrawl_results: list[dict] | None = None
+    idx = 1
+    if tavily_count > 0:
+        tavily_results = gathered[idx]
+        idx += 1
+    if firecrawl_count > 0:
+        firecrawl_results = gathered[idx]
 
-    job = create_search_job(
-        query=query,
-        platform=platform,
-        model=model,
-        effective_model=effective_model,
-        extra_sources=extra_sources,
-        timeout_s=normalize_timeout(timeout_s),
-    )
-    try:
-        pid = spawn_worker(job["job_id"])
-    except Exception as exc:
-        fail_job(job["job_id"], status="failed", error=f"worker spawn failed: {type(exc).__name__}: {exc}")
-        return {"job_id": job["job_id"], "status": "failed", "error": "worker spawn failed"}
+    answer, grok_sources = split_answer_and_sources(grok_result)
+    extra = _extra_results_to_sources(tavily_results, firecrawl_results)
+    all_sources = merge_sources(grok_sources, extra)
 
-    return {
-        "job_id": job["job_id"],
-        "status": "queued",
-        "worker_pid": pid,
-        "model": effective_model,
-        "timeout_s": job["timeout_s"],
-        "poll_after_s": 30,
-        "estimate": _estimate_job_duration(effective_model),
-        "message": "background search job submitted; use get_search_job(job_id) to poll",
-    }
-
-
-@mcp.tool(
-    name="get_search_job",
-    output_schema=None,
-    description="""
-    Get background Grok search job status or completed result.
-
-    For succeeded jobs this returns content and sources_count. Use include_sources=true
-    if the caller needs the full source list in the same response.
-    """,
-    meta={"version": "1.0.0", "author": "guda.studio"},
-)
-async def get_search_job(
-    job_id: Annotated[str, "Job ID returned by submit_search_job."],
-    include_sources: Annotated[bool, "Include full source list when the job succeeded."] = False,
-    max_content_chars: Annotated[int, Field(description="Maximum content characters returned inline.", ge=1000, le=200000)] = 50000,
-) -> dict:
-    job = load_search_job(job_id)
-    if not job:
-        return {"job_id": job_id, "status": "not_found"}
-
-    content = job.get("content") or ""
-    truncated = False
-    if content and len(content) > max_content_chars:
-        content = content[:max_content_chars]
-        truncated = True
-
-    sources = job.get("sources") or []
-    if job.get("status") == "succeeded":
-        await _SOURCES_CACHE.set(job_id, sources)
-
-    result = {
-        "job_id": job_id,
-        "session_id": job_id if job.get("status") == "succeeded" else None,
-        "status": job.get("status"),
-        "model": job.get("effective_model") or job.get("model"),
-        "query": job.get("query"),
-        "sources_count": len(sources),
-        "created_at": job.get("created_at"),
-        "started_at": job.get("started_at"),
-        "updated_at": job.get("updated_at"),
-        "completed_at": job.get("completed_at"),
-        "duration_s": job.get("duration_s"),
-        "running_for_s": job.get("running_for_s"),
-        "timeout_s": job.get("timeout_s"),
-        "timing": job.get("timing") or {},
-        "error": job.get("error"),
-        "content": content if job.get("status") == "succeeded" else "",
-        "content_truncated": truncated,
-    }
-    if include_sources:
-        result["sources"] = sources
-    return result
-
-
-@mcp.tool(
-    name="list_search_jobs",
-    output_schema=None,
-    description="List recent background Grok search jobs.",
-    meta={"version": "1.0.0", "author": "guda.studio"},
-)
-async def list_search_jobs(
-    limit: Annotated[int, Field(description="Maximum number of jobs to return.", ge=1, le=100)] = 10,
-) -> dict:
-    jobs = load_search_jobs(limit)
-    compact = []
-    for job in jobs:
-        compact.append(
-            {
-                "job_id": job.get("job_id"),
-                "status": job.get("status"),
-                "model": job.get("effective_model") or job.get("model"),
-                "query": job.get("query"),
-                "created_at": job.get("created_at"),
-                "updated_at": job.get("updated_at"),
-                "duration_s": job.get("duration_s"),
-                "running_for_s": job.get("running_for_s"),
-                "sources_count": job.get("sources_count"),
-                "error": job.get("error"),
-            }
-        )
-    return {"jobs": compact, "count": len(compact)}
-
-
-@mcp.tool(
-    name="cancel_search_job",
-    output_schema=None,
-    description="Cancel a queued or running background Grok search job.",
-    meta={"version": "1.0.0", "author": "guda.studio"},
-)
-async def cancel_search_job(
-    job_id: Annotated[str, "Job ID returned by submit_search_job."],
-) -> dict:
-    return request_cancel(job_id)
+    await _SOURCES_CACHE.set(session_id, all_sources)
+    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
 
 
 @mcp.tool(
@@ -340,6 +251,56 @@ async def _call_tavily_extract(url: str) -> str | None:
                 content = data["results"][0].get("raw_content", "")
                 return content if content and content.strip() else None
             return None
+    except Exception:
+        return None
+
+
+async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | None:
+    import httpx
+    api_key = config.tavily_api_key
+    if not api_key:
+        return None
+    endpoint = f"{config.tavily_api_url.rstrip('/')}/search"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "advanced",
+        "include_raw_content": False,
+        "include_answer": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(endpoint, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("results", [])
+            return [
+                {"title": r.get("title", ""), "url": r.get("url", ""), "content": r.get("content", ""), "score": r.get("score", 0)}
+                for r in results
+            ] if results else None
+    except Exception:
+        return None
+
+
+async def _call_firecrawl_search(query: str, limit: int = 14) -> list[dict] | None:
+    import httpx
+    api_key = config.firecrawl_api_key
+    if not api_key:
+        return None
+    endpoint = f"{config.firecrawl_api_url.rstrip('/')}/search"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {"query": query, "limit": limit}
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            response = await client.post(endpoint, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("data", {}).get("web", [])
+            return [
+                {"title": r.get("title", ""), "url": r.get("url", ""), "description": r.get("description", "")}
+                for r in results
+            ] if results else None
     except Exception:
         return None
 
